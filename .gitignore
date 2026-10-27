@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+*.rar
+*.zip
+*.onnx
+output_data/
+*_digits/
+dataset_faces/
