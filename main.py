@@ -1,862 +1,1482 @@
-"""Dark-mode Tkinter dashboard for six computer-vision exercises."""
+"""Tkinter/OpenCV application for image and video processing."""
 
-from __future__ import annotations
-
+import argparse
+import base64
 import os
+from pathlib import Path
+import threading
+import time
 import tkinter as tk
-from collections.abc import Callable
 from tkinter import filedialog, messagebox
+from urllib.request import urlretrieve
 
-import cv2
-import numpy as np
-from PIL import Image, ImageTk
+try:
+    import cv2
+    import numpy as np
+except ImportError as import_error:
+    cv2 = None
+    np = None
+    _CV_IMPORT_ERROR = import_error
+else:
+    _CV_IMPORT_ERROR = None
 
 
-class ComputerVisionApp:
-    """Single-window dashboard for the OpenCV workshop."""
+COLORS = {
+    "background": "#F0F2F5",
+    "panel": "#FFFFFF",
+    "border": "#D8DEE6",
+    "text": "#212529",
+    "muted": "#667085",
+    "accent": "#007A87",
+    "accent_hover": "#00636D",
+    "accent_light": "#E2F2F3",
+    "canvas": "#F8FAFC",
+}
 
-    COLORS = {
-        "background": "#1e1e2e",
-        "sidebar": "#181825",
-        "canvas": "#11111b",
-        "button": "#313244",
-        "selected": "#6366f1",
-        "text": "#cdd6f4",
-        "muted": "#a6adc8",
-        "accent": "#cba6f7",
-        "border": "#45475a",
-        "green": "#a6e3a1",
-    }
-    WINDOW_TITLE = "CV Workshop 2026"
-    DISPLAY_MAX_WIDTH = 850
-    DISPLAY_MAX_HEIGHT = 580
 
-    def __init__(self, root: tk.Tk) -> None:
+class VideoApp:
+    def __init__(self, root, video_path=None, initial_mode="rotate"):
         self.root = root
-        self.root.title(self.WINDOW_TITLE)
-        self.root.configure(bg=self.COLORS["background"])
-        self.root.geometry("1200x780")
-        self.root.minsize(1080, 700)
-        self._center_window()
+        self.root.title("NguyenNguyen | Xử lý ảnh & video")
+        self.root.geometry("1180x820")
+        self.root.minsize(850, 640)
+        self.root.configure(bg=COLORS["background"])
+        self.root.grid_columnconfigure(0, weight=1)
+        self.root.grid_rowconfigure(1, weight=1)
 
-        self.cap: cv2.VideoCapture | None = None
-        self.after_id: str | None = None
-        self.video_mode: str | None = None
-        self.current_angle = 0
-        self.rotation_state = 0
-        self.frame_delay_ms = 30
-        self.face_cascade: cv2.CascadeClassifier | None = None
-        self.current_frame: np.ndarray | None = None
-        self.current_faces: list[tuple[int, int, int, int]] = []
-        self.saved_face_count = 0
-        self.display_frame: np.ndarray | None = None
-        self.tk_image: ImageTk.PhotoImage | None = None
-        self.active_task: str | None = None
-        self.source_resolution = "—"
-        self.detected_count: int | None = None
-        self.ball_source: np.ndarray | None = None
-        self.enhance_source: np.ndarray | None = None
-        self.manual_ball_threshold = False
+        self.capture = None
+        self.video_path = None
+        self.source_name = None
+        self.is_webcam = False
+        self.paused = False
+        self.camera_stop_event = threading.Event()
+        self.camera_thread = None
+        self.camera_frame_lock = threading.Lock()
+        self.camera_frame = None
+        self.camera_error = None
+        self.still_image = None
+        self.still_image_path = None
+        self.current_faces = []
+        self.zoom = 1.0
+        self.translate_x = 0
+        self.translate_y = 0
+        self.brightness = 0
+        self.color_mode = "BGR"
+        self.mode = "rotate"
+        self.turns_clockwise = 0
+        self.frame_interval_ms = 33
+        self.duration_seconds = 0.0
+        self.seeking = False
+        self.face_detector = None
+        self.face_cascade = None
+        self.detector_loading = False
+        self.balloon_image = None
+        self.balloon_image_path = None
+        self.balloon_detections = []
+        self.plate_image = None
+        self.plate_image_path = None
+        self.current_frame = None
+        self.current_faces = []
+        self.photo = None
+        self.image_item = None
+        self.closing = False
 
-        self.threshold_var = tk.IntVar(value=127)
-        self.brightness_var = tk.IntVar(value=0)
-        self.status_var = tk.StringVar(value="Sẵn sàng")
-        self.count_var = tk.StringVar(value="—")
-        self.resolution_var = tk.StringVar(value="—")
         self._build_ui()
-        self.root.bind("<Key>", self.handle_key_press)
-        self.root.bind("<KeyPress-a>", lambda e: self._on_key_rotate('a'))
-        self.root.bind("<KeyPress-A>", lambda e: self._on_key_rotate('a'))
-        self.root.bind("<KeyPress-d>", lambda e: self._on_key_rotate('d'))
-        self.root.bind("<KeyPress-D>", lambda e: self._on_key_rotate('d'))
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.bind("<KeyPress>", self.on_key)
+        self.set_mode(initial_mode)
+        if video_path:
+            if initial_mode == "balloons":
+                self.open_balloon_image(video_path)
+            elif initial_mode == "plate":
+                self.open_plate_image(video_path)
+            else:
+                self.open_video(video_path)
+        self.root.after(15, self.update_frame)
 
-    def _center_window(self) -> None:
-        self.root.update_idletasks()
-        width, height = 1200, 780
-        x = max(0, (self.root.winfo_screenwidth() - width) // 2)
-        y = max(0, (self.root.winfo_screenheight() - height) // 2)
-        self.root.geometry(f"{width}x{height}+{x}+{y}")
+    def _build_ui(self):
+        header = tk.Frame(self.root, bg=COLORS["background"], padx=24, pady=18)
+        header.grid(row=0, column=0, sticky="ew")
 
-    def _build_ui(self) -> None:
-        self.root.grid_rowconfigure(0, weight=1)
-        self.root.grid_columnconfigure(0, minsize=320, weight=0)
-        self.root.grid_columnconfigure(1, weight=1)
-
-        sidebar = tk.Frame(
-            self.root, bg=self.COLORS["sidebar"], width=320, padx=20, pady=22
-        )
-        sidebar.grid(row=0, column=0, sticky="nsew")
-        sidebar.grid_propagate(False)
-
-        tk.Label(
-            sidebar,
-            text="CV WORKSHOP 2026",
-            bg=self.COLORS["sidebar"],
-            fg=self.COLORS["accent"],
-            font=("Segoe UI", 17, "bold"),
-            anchor="w",
-        ).pack(fill="x", pady=(0, 22))
-
-        self.task_buttons: dict[str, tk.Button] = {}
-        tasks: tuple[tuple[str, str, Callable[[], None]], ...] = (
-            ("camera", "1. Camera & Grayscale", self.start_camera_grayscale),
-            ("rotate", "2. Video Xoay A/D", self.start_rotating_video),
-            ("faces", "3. Nhận Diện Khuôn Mặt", self.start_face_detection),
-            ("balls", "4. Đếm 12 Quả Bóng", self.count_balls),
-            ("plate", "5. Cắt Ký Tự Biển Số", self.extract_plate_characters),
-            ("enhance", "6. Cân Bằng Sáng & Resize", self.enhance_brightness_and_resize),
-        )
-        for key, label, command in tasks:
-            button = tk.Button(
-                sidebar,
-                text=label,
-                command=command,
-                anchor="w",
-                padx=14,
-                pady=10,
-                relief="flat",
-                bd=0,
-                bg=self.COLORS["button"],
-                fg=self.COLORS["text"],
-                activebackground=self.COLORS["selected"],
-                activeforeground="white",
-                font=("Segoe UI", 10, "bold"),
-                cursor="hand2",
-            )
-            button.pack(fill="x", pady=4)
-            self.task_buttons[key] = button
-
-        tk.Frame(sidebar, bg=self.COLORS["border"], height=1).pack(
-            fill="x", pady=14
-        )
-        self._make_control_button(
-            sidebar, "Dừng Luồng (Stop)", self.stop_media
-        ).pack(fill="x", pady=4)
-        self._make_control_button(
-            sidebar, "Lưu Khuôn Mặt (Phím S)", self.save_detected_faces
-        ).pack(fill="x", pady=4)
-
-        tk.Label(
-            sidebar,
-            text="Ngưỡng Nhị Phân (0 - 255)",
-            bg=self.COLORS["sidebar"],
-            fg=self.COLORS["text"],
-            font=("Segoe UI", 9, "bold"),
-            anchor="w",
-        ).pack(fill="x", pady=(18, 2))
-        self.threshold_scale = tk.Scale(
-            sidebar,
-            from_=0,
-            to=255,
-            orient="horizontal",
-            variable=self.threshold_var,
-            command=self._on_threshold_change,
-            bg=self.COLORS["sidebar"],
-            fg=self.COLORS["text"],
-            troughcolor=self.COLORS["button"],
-            highlightthickness=0,
-            activebackground=self.COLORS["selected"],
-            showvalue=True,
-            font=("Segoe UI", 9),
-        )
-        self.threshold_scale.pack(fill="x")
-
-        tk.Label(
-            sidebar,
-            text="Độ Sáng (0 - 100)",
-            bg=self.COLORS["sidebar"],
-            fg=self.COLORS["text"],
-            font=("Segoe UI", 9, "bold"),
-            anchor="w",
-        ).pack(fill="x", pady=(14, 2))
-        self.brightness_scale = tk.Scale(
-            sidebar,
-            from_=0,
-            to=100,
-            orient="horizontal",
-            variable=self.brightness_var,
-            command=self._on_brightness_change,
-            bg=self.COLORS["sidebar"],
-            fg=self.COLORS["text"],
-            troughcolor=self.COLORS["button"],
-            highlightthickness=0,
-            activebackground=self.COLORS["selected"],
-            showvalue=True,
-            font=("Segoe UI", 9),
-        )
-        self.brightness_scale.pack(fill="x")
-
-        content = tk.Frame(self.root, bg=self.COLORS["background"], padx=16, pady=14)
-        content.grid(row=0, column=1, sticky="nsew")
-        content.grid_rowconfigure(1, weight=1)
-        content.grid_columnconfigure(0, weight=1)
-
-        tk.Label(
-            content,
-            text="Computer Vision Dashboard",
-            bg=self.COLORS["background"],
-            fg=self.COLORS["text"],
+        title = tk.Label(
+            header,
+            text="NGUYEN NGUYEN - CEO APPLE",
+            bg=COLORS["background"],
+            fg=COLORS["text"],
             font=("Segoe UI", 18, "bold"),
-            anchor="w",
-        ).grid(row=0, column=0, sticky="ew", pady=(2, 12))
-
-        canvas_frame = tk.Frame(
-            content,
-            bg=self.COLORS["canvas"],
-            highlightbackground=self.COLORS["border"],
-            highlightthickness=1,
         )
-        canvas_frame.grid(row=1, column=0, sticky="nsew")
-        canvas_frame.grid_rowconfigure(0, weight=1)
-        canvas_frame.grid_columnconfigure(0, weight=1)
-        self.canvas = tk.Canvas(
-            canvas_frame,
-            bg=self.COLORS["canvas"],
+        title.pack(side="left")
+
+        source_buttons = tk.Frame(header, bg=COLORS["background"])
+        source_buttons.pack(side="right")
+        self._make_button(source_buttons, "Mở ảnh", self.choose_image).pack(
+            side="left", padx=(0, 6)
+        )
+        self.webcam_button = self._make_button(
+            source_buttons, "Mở Webcam", self.open_webcam, primary=True
+        )
+        self.webcam_button.pack(side="left", padx=(0, 6))
+        self.open_button = tk.Button(
+            source_buttons,
+            text="Mở video",
+            command=self.choose_video,
+            bg=COLORS["accent"],
+            fg="#FFFFFF",
+            activebackground=COLORS["accent_hover"],
+            activeforeground="#FFFFFF",
+            relief="flat",
+            padx=18,
+            pady=9,
+            cursor="hand2",
+            font=("Segoe UI", 10, "bold"),
+        )
+        self.open_button.pack(side="left", padx=(0, 6))
+        self.replay_button = self._make_button(
+            source_buttons, "Phát lại", self.replay_video
+        )
+        self.replay_button.configure(state=tk.DISABLED)
+        self.replay_button.pack(side="left")
+        self.transport_button = self._make_button(
+            source_buttons, "⏸ Tạm dừng", self.toggle_pause, primary=True
+        )
+        self.transport_button.pack(side="left", padx=(6, 0))
+
+        video_area = tk.Frame(
+            self.root, bg=COLORS["panel"], padx=12, pady=12,
+            highlightbackground=COLORS["border"], highlightthickness=1,
+        )
+        video_area.grid(row=1, column=0, sticky="nsew")
+        video_area.grid_rowconfigure(0, weight=1)
+        video_area.grid_columnconfigure(0, weight=1)
+        self.video_canvas = tk.Canvas(
+            video_area,
+            width=640,
+            height=360,
+            bg=COLORS["canvas"],
             highlightthickness=0,
-            width=self.DISPLAY_MAX_WIDTH,
-            height=self.DISPLAY_MAX_HEIGHT,
         )
-        self.canvas.grid(row=0, column=0, sticky="nsew")
-        self.canvas.bind("<Configure>", self._redraw_current_image)
-        self._draw_welcome()
-
-        status_card = tk.Frame(
-            content,
-            bg=self.COLORS["sidebar"],
-            padx=14,
-            pady=10,
-            highlightbackground=self.COLORS["border"],
-            highlightthickness=1,
+        self.video_canvas.grid(row=0, column=0, sticky="nsew")
+        self.placeholder_item = self.video_canvas.create_text(
+            320,
+            180,
+            text="Mở ảnh, video hoặc webcam để bắt đầu",
+            fill=COLORS["muted"],
+            font=("Segoe UI", 16),
         )
-        status_card.grid(row=2, column=0, sticky="ew", pady=(12, 0))
-        status_card.grid_columnconfigure(0, weight=3)
-        status_card.grid_columnconfigure(1, weight=1)
-        status_card.grid_columnconfigure(2, weight=1)
-        self._status_item(status_card, "TRẠNG THÁI", self.status_var, 0)
-        self._status_item(status_card, "PHÁT HIỆN", self.count_var, 1)
-        self._status_item(status_card, "ĐỘ PHÂN GIẢI", self.resolution_var, 2)
+        self.video_canvas.bind("<Configure>", self._resize_placeholder)
 
-    def _make_control_button(
-        self, parent: tk.Widget, text: str, command: Callable[[], None]
-    ) -> tk.Button:
+        seek_area = tk.Frame(
+            self.root, bg=COLORS["background"], padx=24, pady=6
+        )
+        self.seek_area = seek_area
+        seek_area.grid(row=2, column=0, sticky="ew")
+        seek_area.grid_columnconfigure(1, weight=1)
+        self.position_var = tk.StringVar(value="00:00")
+        self.duration_var = tk.StringVar(value="00:00")
+        tk.Label(
+            seek_area,
+            textvariable=self.position_var,
+            bg=COLORS["background"],
+            fg=COLORS["muted"],
+            width=6,
+            anchor="w",
+            font=("Segoe UI", 9),
+        ).grid(row=0, column=0, padx=(0, 8))
+        self.seek_var = tk.DoubleVar(value=0)
+        self.seek_scale = tk.Scale(
+            seek_area,
+            from_=0,
+            to=1,
+            orient=tk.HORIZONTAL,
+            resolution=0.1,
+            showvalue=False,
+            variable=self.seek_var,
+            command=self._seek_changed,
+            bg=COLORS["background"],
+            fg=COLORS["text"],
+            troughcolor=COLORS["border"],
+            activebackground=COLORS["accent"],
+            highlightthickness=0,
+            borderwidth=0,
+            sliderlength=18,
+            state=tk.DISABLED,
+        )
+        self.seek_scale.grid(row=0, column=1, sticky="ew")
+        self.seek_scale.bind("<ButtonPress-1>", self._start_seek)
+        self.seek_scale.bind("<ButtonRelease-1>", self._finish_seek)
+        tk.Label(
+            seek_area,
+            textvariable=self.duration_var,
+            bg=COLORS["background"],
+            fg=COLORS["muted"],
+            width=6,
+            anchor="e",
+            font=("Segoe UI", 9),
+        ).grid(row=0, column=2, padx=(8, 0))
+
+        controls = tk.Frame(
+            self.root, bg=COLORS["panel"], padx=18, pady=14,
+            highlightbackground=COLORS["border"], highlightthickness=1,
+        )
+        controls.grid(row=3, column=0, sticky="ew", padx=24, pady=(8, 0))
+
+        mode_group = tk.Frame(controls, bg=COLORS["panel"])
+        mode_group.pack(fill="x")
+        tk.Label(
+            mode_group,
+            text="CHẾ ĐỘ",
+            bg=COLORS["panel"],
+            fg=COLORS["muted"],
+            font=("Segoe UI", 9, "bold"),
+        ).pack(anchor="w", pady=(0, 7))
+
+        self.mode_tabs = tk.Canvas(
+            mode_group, height=40, bg=COLORS["panel"], highlightthickness=0
+        )
+        self.mode_tabs.pack(fill="x")
+        self.mode_tab_values = ("rotate", "faces", "balloons", "plate")
+        self.mode_tab_labels = (
+            "Ảnh / Xoay video", "Nhận diện mặt", "Đếm bóng bay", "Tách biển số"
+        )
+        self.mode_tabs.bind("<Configure>", self._draw_mode_tabs)
+        self.mode_tabs.bind("<Button-1>", self._mode_tab_click)
+
+        self.action_area = tk.Frame(controls, bg=COLORS["panel"])
+        self.action_area.pack(fill="x", pady=(10, 0))
+
+        self.rotate_actions = tk.Frame(self.action_area, bg=COLORS["panel"])
+        self._make_button(
+            self.rotate_actions, "Xoay trái 90°", lambda: self.rotate(-1)
+        ).pack(side="left", padx=(0, 7))
+        self._make_button(
+            self.rotate_actions, "Xoay phải 90°", lambda: self.rotate(1)
+        ).pack(side="left", padx=(0, 6))
+        self._make_button(
+            self.rotate_actions, "−", lambda: self.change_zoom(0.8)
+        ).pack(side="left", padx=(0, 2))
+        self._make_button(
+            self.rotate_actions, "Zoom +", lambda: self.change_zoom(1.25)
+        ).pack(side="left", padx=(0, 6))
+        self._make_button(
+            self.rotate_actions, "←", lambda: self.translate(-30, 0)
+        ).pack(side="left", padx=2)
+        self._make_button(
+            self.rotate_actions, "↑", lambda: self.translate(0, -30)
+        ).pack(side="left", padx=2)
+        self._make_button(
+            self.rotate_actions, "↓", lambda: self.translate(0, 30)
+        ).pack(side="left", padx=2)
+        self._make_button(
+            self.rotate_actions, "→", lambda: self.translate(30, 0)
+        ).pack(side="left", padx=(2, 6))
+        self._make_button(
+            self.rotate_actions, "Đặt lại", self.reset_transform
+        ).pack(side="left", padx=(0, 8))
+        self.brightness_var = tk.IntVar(value=0)
+        tk.Label(
+            self.rotate_actions,
+            text="Độ sáng",
+            bg=COLORS["panel"],
+            fg=COLORS["muted"],
+            font=("Segoe UI", 9),
+        ).pack(side="left", padx=(0, 4))
+        self.brightness_scale = tk.Scale(
+            self.rotate_actions, from_=-100, to=100, orient=tk.HORIZONTAL,
+            variable=self.brightness_var, command=self._brightness_changed,
+            bg=COLORS["panel"], fg=COLORS["text"], troughcolor=COLORS["border"],
+            activebackground=COLORS["accent"], highlightthickness=0,
+            borderwidth=0, length=110, showvalue=False,
+        )
+        self.brightness_scale.pack(side="left", padx=(0, 6))
+        self.color_var = tk.StringVar(value="BGR")
+        self.color_menu = tk.OptionMenu(
+            self.rotate_actions, self.color_var, "BGR", "Grayscale", "HSV",
+            command=self._color_mode_changed,
+        )
+        self.color_menu.configure(
+            bg=COLORS["panel"], fg=COLORS["text"], relief="flat",
+            highlightthickness=1, highlightbackground=COLORS["border"],
+            activebackground=COLORS["accent_light"], cursor="hand2",
+        )
+        self.color_menu.pack(side="left")
+
+        self.face_actions = tk.Frame(self.action_area, bg=COLORS["panel"])
+        self.save_button = self._make_button(
+            self.face_actions,
+            "Lưu khuôn mặt",
+            self.save_faces,
+            primary=True,
+        )
+        self.save_button.pack(side="left")
+
+        self.balloon_actions = tk.Frame(self.action_area, bg=COLORS["panel"])
+        self.open_image_button = self._make_button(
+            self.balloon_actions,
+            "Mở ảnh và đếm",
+            self.choose_balloon_image,
+            primary=True,
+        )
+        self.open_image_button.pack(side="left")
+
+        self.plate_actions = tk.Frame(self.action_area, bg=COLORS["panel"])
+        self.open_plate_button = self._make_button(
+            self.plate_actions,
+            "Mở ảnh và tách số",
+            self.choose_plate_image,
+            primary=True,
+        )
+        self.open_plate_button.pack(side="left")
+
+        self.status_var = tk.StringVar(value="Chưa chọn video")
+        self.status_label = tk.Label(
+            self.root,
+            textvariable=self.status_var,
+            bg="#E5E9EF",
+            fg=COLORS["text"],
+            anchor="w",
+            padx=24,
+            pady=12,
+            font=("Segoe UI", 9),
+        )
+        self.status_label.grid(row=4, column=0, sticky="ew")
+
+    def _resize_placeholder(self, event):
+        if self.image_item is None:
+            self.video_canvas.coords(
+                self.placeholder_item, event.width // 2, event.height // 2
+            )
+
+    @staticmethod
+    def _draw_pill(canvas, x1, y1, x2, y2, fill):
+        radius = max(1, (y2 - y1) // 2)
+        canvas.create_rectangle(
+            x1 + radius, y1, x2 - radius, y2, fill=fill, outline=fill
+        )
+        canvas.create_oval(x1, y1, x1 + 2 * radius, y2, fill=fill, outline=fill)
+        canvas.create_oval(x2 - 2 * radius, y1, x2, y2, fill=fill, outline=fill)
+
+    def _draw_mode_tabs(self, _event=None):
+        if not hasattr(self, "mode_tabs"):
+            return
+        canvas = self.mode_tabs
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 4)
+        height = 36
+        self._draw_pill(canvas, 0, 2, width, height + 2, "#E9EDF2")
+        active_index = self.mode_tab_values.index(self.mode)
+        segment_width = width / len(self.mode_tab_values)
+        x1 = int(active_index * segment_width + 3)
+        x2 = int((active_index + 1) * segment_width - 3)
+        self._draw_pill(canvas, x1, 5, x2, height - 1, COLORS["accent"])
+        for index, label in enumerate(self.mode_tab_labels):
+            canvas.create_text(
+                (index + 0.5) * segment_width,
+                height / 2 + 1,
+                text=label,
+                fill="#FFFFFF" if index == active_index else COLORS["text"],
+                font=("Segoe UI", 9, "bold" if index == active_index else "normal"),
+            )
+
+    def _mode_tab_click(self, event):
+        if not self.mode_tab_values:
+            return
+        index = min(
+            len(self.mode_tab_values) - 1,
+            int(event.x / max(self.mode_tabs.winfo_width(), 1) * len(
+                self.mode_tab_values
+            )),
+        )
+        self.set_mode(self.mode_tab_values[index])
+
+    def _show_placeholder(self, text):
+        if self.image_item is not None:
+            self.video_canvas.delete(self.image_item)
+            self.image_item = None
+        self.video_canvas.delete(self.placeholder_item)
+        self.placeholder_item = self.video_canvas.create_text(
+            self.video_canvas.winfo_width() // 2,
+            self.video_canvas.winfo_height() // 2,
+            text=text,
+            fill=COLORS["muted"],
+            font=("Segoe UI", 16),
+        )
+
+    @staticmethod
+    def _make_button(parent, text, command, primary=False):
+        background = COLORS["accent"] if primary else "#E9EDF2"
+        foreground = "#FFFFFF" if primary else COLORS["text"]
         return tk.Button(
             parent,
             text=text,
             command=command,
-            anchor="w",
-            padx=14,
-            pady=8,
+            bg=background,
+            fg=foreground,
+            activebackground=COLORS["accent_hover"] if primary else "#DCE3EA",
+            activeforeground=foreground,
+            disabledforeground="#98A2B3",
             relief="flat",
-            bd=0,
-            bg=self.COLORS["button"],
-            fg=self.COLORS["text"],
-            activebackground=self.COLORS["selected"],
-            activeforeground="white",
-            font=("Segoe UI", 9),
+            padx=14,
+            pady=10,
             cursor="hand2",
+            font=("Segoe UI", 10, "bold"),
         )
 
-    def _status_item(
-        self, parent: tk.Frame, title: str, variable: tk.StringVar, column: int
-    ) -> None:
-        item = tk.Frame(parent, bg=self.COLORS["sidebar"])
-        item.grid(row=0, column=column, sticky="ew", padx=(0, 12))
-        tk.Label(
-            item,
-            text=title,
-            bg=self.COLORS["sidebar"],
-            fg=self.COLORS["muted"],
-            font=("Segoe UI", 8, "bold"),
-            anchor="w",
-        ).pack(fill="x")
-        tk.Label(
-            item,
-            textvariable=variable,
-            bg=self.COLORS["sidebar"],
-            fg=self.COLORS["text"],
-            font=("Segoe UI", 9),
-            anchor="w",
-            wraplength=360,
-        ).pack(fill="x", pady=(3, 0))
+    def set_mode(self, mode):
+        self.mode = mode
+        self.current_faces = []
+        self._draw_mode_tabs()
 
-    def _draw_welcome(self) -> None:
-        self.canvas.delete("all")
-        self.canvas.create_text(
-            max(1, self.canvas.winfo_width() // 2),
-            max(1, self.canvas.winfo_height() // 2),
-            text="Chọn một bài tập ở thanh điều khiển",
-            fill=self.COLORS["muted"],
-            font=("Segoe UI", 15),
-        )
-
-    def _set_task(self, task: str, status: str) -> None:
-        self.active_task = task
-        for key, button in self.task_buttons.items():
-            selected = key == task
-            button.configure(
-                bg=self.COLORS["selected"] if selected else self.COLORS["button"],
-                fg="white" if selected else self.COLORS["text"],
+        self.rotate_actions.pack_forget()
+        self.face_actions.pack_forget()
+        self.balloon_actions.pack_forget()
+        self.plate_actions.pack_forget()
+        if mode == "rotate":
+            self.rotate_actions.pack(side="left")
+            self.open_button.configure(text="Mở video", command=self.choose_video)
+            self.status_var.set(self._video_status("Chế độ ảnh và video"))
+        elif mode == "faces":
+            self.face_actions.pack(side="left")
+            self.open_button.configure(text="Mở video", command=self.choose_video)
+            self.status_var.set(self._video_status("Đang chuẩn bị nhận diện khuôn mặt"))
+            self._ensure_face_detector()
+        elif mode == "balloons":
+            self.balloon_actions.pack(side="left")
+            self.open_button.configure(
+                text="Mở ảnh", command=self.choose_balloon_image
             )
-        self.status_var.set(status)
-        self.detected_count = None
-        self.count_var.set("—")
-        self.source_resolution = "—"
-        self.resolution_var.set("—")
-
-    def _set_resolution(self, image: np.ndarray) -> None:
-        height, width = image.shape[:2]
-        self.source_resolution = f"{width} × {height}"
-        self.resolution_var.set(self.source_resolution)
-
-    def _set_count(self, count: int) -> None:
-        self.detected_count = count
-        self.count_var.set(str(count))
-
-    def _show_error(self, title: str, error: Exception) -> None:
-        self.status_var.set(str(error))
-        messagebox.showerror(title, str(error), parent=self.root)
-
-    def _show_image(self, image_bgr: np.ndarray) -> None:
-        self.display_frame = image_bgr.copy()
-        self._render_display_frame()
-
-    def _render_display_frame(self) -> None:
-        if self.display_frame is None:
-            return
-        image_rgb = cv2.cvtColor(self.display_frame, cv2.COLOR_BGR2RGB)
-        pil_image = Image.fromarray(image_rgb)
-        max_width = min(
-            self.DISPLAY_MAX_WIDTH, max(1, self.canvas.winfo_width() - 20)
-        )
-        max_height = min(
-            self.DISPLAY_MAX_HEIGHT, max(1, self.canvas.winfo_height() - 20)
-        )
-        pil_image.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
-        self.tk_image = ImageTk.PhotoImage(pil_image)
-        self.canvas.delete("all")
-        self.canvas.create_image(
-            self.canvas.winfo_width() // 2,
-            self.canvas.winfo_height() // 2,
-            image=self.tk_image,
-            anchor="center",
-        )
-
-    def _redraw_current_image(self, _event: tk.Event | None = None) -> None:
-        if self.display_frame is not None:
-            self._render_display_frame()
+            self.status_var.set("Chọn ảnh để đếm bóng bay")
+            self._show_placeholder("Chọn ảnh để đếm bóng bay")
         else:
-            self._draw_welcome()
+            self.plate_actions.pack(side="left")
+            self.open_button.configure(
+                text="Mở ảnh", command=self.choose_plate_image
+            )
+            self.status_var.set("Chọn ảnh biển số để tách ký tự")
+            self._show_placeholder("Chọn ảnh biển số để bắt đầu")
 
-    def _stop_stream(self) -> None:
-        if self.after_id is not None:
+        if mode in ("balloons", "plate"):
+            if self.capture is not None:
+                self._stop_camera_reader()
+                if self.capture is not None:
+                    self.capture.release()
+                    self.capture = None
+            self.seek_scale.configure(state=tk.DISABLED)
+            self.seek_area.grid_remove()
+            self.replay_button.pack_forget()
+            self.transport_button.pack_forget()
+        else:
+            self.seek_area.grid()
+            if self.video_path and self.replay_button.winfo_manager() == "":
+                self.replay_button.pack(side="right", padx=(0, 8))
+            if self.transport_button.winfo_manager() == "":
+                self.transport_button.pack(side="left", padx=(6, 0))
+            self.seek_scale.configure(
+                state=tk.NORMAL if self.duration_seconds > 0 else tk.DISABLED
+            )
+        self._update_transport_button()
+        if mode in ("rotate", "faces") and self.still_image is not None:
+            self._render_still_image()
+
+    @staticmethod
+    def _read_image(path):
+        image_bytes = np.fromfile(path, dtype=np.uint8)
+        return cv2.imdecode(image_bytes, cv2.IMREAD_COLOR)
+
+    @staticmethod
+    def _write_image(path, image):
+        extension = Path(path).suffix or ".png"
+        success, encoded = cv2.imencode(extension, image)
+        if not success:
+            return False
+        encoded.tofile(str(path))
+        return True
+
+    def choose_image(self):
+        path = filedialog.askopenfilename(
+            title="Chọn ảnh",
+            filetypes=(
+                ("Ảnh", "*.jpg *.jpeg *.png *.bmp *.webp *.tif *.tiff"),
+                ("Tất cả file", "*.*"),
+            ),
+        )
+        if path:
+            self.open_image(path)
+
+    def open_image(self, path):
+        if self.mode == "balloons":
+            self.open_balloon_image(path)
+            return
+        if self.mode == "plate":
+            self.open_plate_image(path)
+            return
+        try:
+            image = self._read_image(path)
+        except (OSError, cv2.error) as error:
+            self.status_var.set(f"Lỗi đọc ảnh: {error}")
+            return
+        if image is None:
+            self.status_var.set(f"Không mở được ảnh: {path}")
+            return
+        if self.capture is not None:
+            self._stop_camera_reader()
+            if self.capture is not None:
+                self.capture.release()
+                self.capture = None
+        self.video_path = None
+        self.source_name = Path(path).name
+        self.is_webcam = False
+        self.still_image = image
+        self.still_image_path = path
+        self.current_frame = image
+        self.current_faces = []
+        self.duration_seconds = 0.0
+        self.paused = True
+        self.seek_scale.configure(state=tk.DISABLED)
+        self.replay_button.configure(state=tk.DISABLED)
+        self.position_var.set("--:--")
+        self.duration_var.set("--:--")
+        if self.mode == "faces":
+            self._render_still_image()
+            self.status_var.set(
+                f"Ảnh: {self.source_name}  |  "
+                f"Tìm thấy {len(self.current_faces)} khuôn mặt"
+            )
+        else:
+            self._render_still_image()
+            self.status_var.set(f"Đang hiển thị ảnh  |  {self.source_name}")
+        self._update_transport_button()
+
+    def open_webcam(self):
+        if self.mode in ("balloons", "plate"):
+            self.set_mode("rotate")
+        self._stop_camera_reader()
+        camera_sources = [
+            (0, getattr(cv2, "CAP_DSHOW", cv2.CAP_ANY)),
+            (0, getattr(cv2, "CAP_MSMF", cv2.CAP_ANY)),
+            (0, cv2.CAP_ANY),
+            (1, cv2.CAP_ANY),
+            (2, cv2.CAP_ANY),
+        ]
+        new_capture = None
+        camera_errors = []
+        for camera_index, backend in camera_sources:
             try:
-                self.root.after_cancel(self.after_id)
-            except tk.TclError:
-                pass
-            self.after_id = None
-        if self.cap is not None:
-            self.cap.release()
-            self.cap = None
-        self.video_mode = None
+                candidate = cv2.VideoCapture(camera_index, backend)
+                if candidate.isOpened():
+                    new_capture = candidate
+                    break
+                candidate.release()
+            except cv2.error as error:
+                camera_errors.append(str(error))
+
+        if new_capture is None:
+            detail = f" Chi tiết: {camera_errors[-1]}" if camera_errors else ""
+            self.status_var.set(
+                "Không mở được webcam (đã thử camera 0–2). "
+                "Kiểm tra kết nối, quyền camera và ứng dụng đang sử dụng camera."
+                + detail
+            )
+            return
+        self.capture = new_capture
+        self.video_path = None
+        self.source_name = "Webcam"
+        self.is_webcam = True
+        self.paused = False
+        self.duration_seconds = 0.0
+        self.seek_scale.configure(state=tk.DISABLED)
+        self.position_var.set("LIVE")
+        self.duration_var.set("LIVE")
+        self.replay_button.configure(state=tk.DISABLED)
+        self.still_image = None
+        self.still_image_path = None
         self.current_frame = None
         self.current_faces = []
-
-    def stop_media(self) -> None:
-        self._stop_stream()
-        self.active_task = None
-        for button in self.task_buttons.values():
-            button.configure(bg=self.COLORS["button"], fg=self.COLORS["text"])
-        self.status_var.set("Đã dừng camera/video")
-        self.count_var.set("—")
-
-    def _open_camera(self) -> cv2.VideoCapture:
-        for camera_index in range(3):
-            candidate = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
-            if candidate.isOpened():
-                return candidate
-            candidate.release()
-        raise RuntimeError("Không thể mở camera. Vui lòng kiểm tra webcam.")
-
-    def start_camera_grayscale(self) -> None:
-        self._stop_stream()
-        self._set_task("camera", "Bài 1 đang khởi động camera")
+        self.camera_stop_event = threading.Event()
+        self.camera_frame = None
+        self.camera_error = None
         try:
-            self.cap = self._open_camera()
-            self.video_mode = "grayscale"
-            self.status_var.set("Bài 1 đang chạy · nhấn Q hoặc Stop để dừng")
-            self._schedule_frame()
-        except (cv2.error, RuntimeError) as error:
-            self._stop_stream()
-            self._show_error("Lỗi camera", error)
-
-    def start_rotating_video(self) -> None:
-        self.root.focus_set()
-        self.root.focus_force()
-        self._stop_stream()
-        self._set_task("rotate", "Chọn video để bắt đầu Bài 2")
-        self.root.bind("<KeyPress-a>", lambda e: self._on_key_rotate('a'))
-        self.root.bind("<KeyPress-A>", lambda e: self._on_key_rotate('a'))
-        self.root.bind("<KeyPress-d>", lambda e: self._on_key_rotate('d'))
-        self.root.bind("<KeyPress-D>", lambda e: self._on_key_rotate('d'))
-        path = filedialog.askopenfilename(
-            parent=self.root,
-            title="Chọn video",
-            filetypes=(("Video", "*.mp4 *.avi *.mov *.mkv"),),
+            new_capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except cv2.error:
+            pass
+        self.camera_thread = threading.Thread(
+            target=self._camera_reader, args=(new_capture, self.camera_stop_event),
+            daemon=True,
         )
-        if not path:
-            self.status_var.set("Sẵn sàng")
-            return
-        try:
-            self.cap = cv2.VideoCapture(path)
-            if not self.cap.isOpened():
-                raise RuntimeError("Không thể mở file video đã chọn.")
-            fps = self.cap.get(cv2.CAP_PROP_FPS)
-            self.frame_delay_ms = max(1, int(1000 / fps)) if fps > 0 else 30
-            self.current_angle = 0
-            self.rotation_state = 0
-            self.video_mode = "rotate"
-            self.status_var.set("Bài 2 đang chạy · phím A/D xoay, Q dừng")
-            self.root.focus_set()
-            self.root.focus_force()
-            self._schedule_frame(self.frame_delay_ms)
-        except (cv2.error, RuntimeError) as error:
-            self._stop_stream()
-            self._show_error("Lỗi video", error)
+        self.camera_thread.start()
+        self.status_var.set("Webcam đang phát")
+        self._update_transport_button()
 
-    def start_face_detection(self) -> None:
-        self._stop_stream()
-        self._set_task("faces", "Đang khởi động nhận diện khuôn mặt")
+    def _camera_reader(self, capture, stop_event):
         try:
-            cascade_path = (
-                cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            while not stop_event.is_set():
+                success, frame = capture.read()
+                if not success or frame is None:
+                    self.camera_error = "Không nhận được frame từ webcam."
+                    break
+                with self.camera_frame_lock:
+                    self.camera_frame = frame
+        except Exception as error:
+            self.camera_error = f"Lỗi đọc webcam: {error}"
+
+    def _stop_camera_reader(self):
+        self.camera_stop_event.set()
+        capture = self.capture
+        if capture is not None:
+            capture.release()
+        thread = self.camera_thread
+        if thread is not None and thread.is_alive() \
+                and thread is not threading.current_thread():
+            thread.join(timeout=0.25)
+        self.capture = None
+        self.camera_thread = None
+        self.is_webcam = False
+
+    def _update_transport_button(self):
+        if self.capture is None:
+            self.transport_button.configure(
+                text="▶ Phát", state=tk.DISABLED
             )
-            self.face_cascade = cv2.CascadeClassifier(cascade_path)
-            if self.face_cascade.empty():
-                self.face_cascade = None
-                self.status_var.set("Lỗi: Không tìm thấy file haarcascade XML")
-                return
-            os.makedirs("dataset_faces", exist_ok=True)
-            self.saved_face_count = self._next_numeric_filename("dataset_faces")
-            self.cap = self._open_camera()
-            self.video_mode = "faces"
-            self.status_var.set("Bài 3 đang chạy · nhấn S lưu mặt, Q dừng")
-            self._schedule_frame()
-        except (cv2.error, OSError, RuntimeError) as error:
-            self._stop_stream()
-            self._show_error("Lỗi nhận diện khuôn mặt", error)
-
-    def _schedule_frame(self, delay_ms: int = 30) -> None:
-        self.after_id = self.root.after(delay_ms, self._update_frame)
-
-    def _update_frame(self) -> None:
-        self.after_id = None
-        if self.cap is None or self.video_mode is None:
-            return
-        try:
-            success, frame = self.cap.read()
-            if not success:
-                self._stop_stream()
-                self.status_var.set("Video đã phát hết")
-                return
-            self._set_resolution(frame)
-
-            if self.video_mode == "grayscale":
-                frame = cv2.flip(frame, 1)
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                display_frame = np.hstack(
-                    (frame, cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR))
-                )
-                cv2.putText(
-                    display_frame, "COLOR", (16, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
-                )
-                cv2.putText(
-                    display_frame, "GRAYSCALE", (frame.shape[1] + 16, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
-                )
-            elif self.video_mode == "rotate":
-                if self.current_angle == 90:
-                    frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-                elif self.current_angle == 180:
-                    frame = cv2.rotate(frame, cv2.ROTATE_180)
-                elif self.current_angle == 270:
-                    frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-                display_frame = frame
-            else:
-                if self.face_cascade is None:
-                    raise RuntimeError("Bộ phân loại khuôn mặt chưa được khởi tạo.")
-                frame = cv2.flip(frame, 1)
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                gray = cv2.equalizeHist(gray)
-                faces = self.face_cascade.detectMultiScale(
-                    gray,
-                    scaleFactor=1.1,
-                    minNeighbors=3,
-                    minSize=(60, 60),
-                    flags=cv2.CASCADE_SCALE_IMAGE,
-                )
-                self.current_frame = frame.copy()
-                self.current_faces = [
-                    (int(x), int(y), int(w), int(h)) for x, y, w, h in faces
-                ]
-                for x, y, width, height in self.current_faces:
-                    cv2.rectangle(
-                        frame, (x, y), (x + width, y + height), (0, 255, 0), 2
-                    )
-                cv2.putText(
-                    frame,
-                    f"So luong mat: {len(self.current_faces)}",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 0, 255),
-                    2,
-                )
-                self._set_count(len(self.current_faces))
-                display_frame = frame
-
-            self._show_image(display_frame)
-            if self.video_mode is not None:
-                delay = self.frame_delay_ms if self.video_mode == "rotate" else 30
-                self._schedule_frame(delay)
-        except (cv2.error, RuntimeError, AttributeError) as error:
-            self._stop_stream()
-            self._show_error("Lỗi xử lý khung hình", error)
-
-    def _on_key_rotate(self, key: str) -> None:
-        if key == "a":
-            self.current_angle = (self.current_angle - 90) % 360
-        elif key == "d":
-            self.current_angle = (self.current_angle + 90) % 360
-        self.rotation_state = (self.current_angle // 90) % 4
-        self.root.focus_set()
-
-    def handle_key_press(self, event: tk.Event) -> None:
-        key = event.keysym.lower()
-        if key == "q" and self.video_mode is not None:
-            self.stop_media()
-        elif self.video_mode == "rotate" and key in ("a", "d"):
-            self._on_key_rotate(key)
-        elif key == "s" and self.video_mode == "faces":
-            self.save_detected_faces()
-
-    def save_detected_faces(self) -> None:
-        if self.video_mode != "faces" or self.current_frame is None:
-            self.status_var.set("Hãy chạy Bài 3 trước khi lưu khuôn mặt")
-            return
-        if not self.current_faces:
-            self.status_var.set("Không phát hiện khuôn mặt trong khung hiện tại")
-            return
-        try:
-            os.makedirs("dataset_faces", exist_ok=True)
-            self.saved_face_count = max(
-                self.saved_face_count,
-                self._next_numeric_filename("dataset_faces"),
-            )
-            saved = 0
-            for x, y, width, height in self.current_faces:
-                while os.path.exists(
-                    os.path.join("dataset_faces", f"{self.saved_face_count}.png")
-                ):
-                    self.saved_face_count += 1
-                crop = self.current_frame[y : y + height, x : x + width]
-                output_path = os.path.join(
-                    "dataset_faces", f"{self.saved_face_count}.png"
-                )
-                if not cv2.imwrite(output_path, crop):
-                    raise RuntimeError(f"Không thể lưu ảnh: {output_path}")
-                self.saved_face_count += 1
-                saved += 1
-            self.status_var.set(
-                f"Đã lưu {saved} khuôn mặt vào thư mục dataset_faces"
-            )
-        except (cv2.error, OSError, RuntimeError) as error:
-            self._show_error("Lỗi lưu khuôn mặt", error)
-
-    def count_balls(self) -> None:
-        self._stop_stream()
-        self.ball_source = None
-        self._set_task("balls", "Chọn ảnh 12 quả bóng")
-        path = filedialog.askopenfilename(
-            parent=self.root,
-            title="Chọn ảnh các quả bóng",
-            filetypes=(("Image", "*.png *.jpg *.jpeg *.bmp"),),
-        )
-        if not path:
-            self.status_var.set("Sẵn sàng")
-            return
-        try:
-            image = cv2.imread(path)
-            if image is None:
-                raise RuntimeError("Không thể đọc file ảnh đã chọn.")
-            self.ball_source = image.copy()
-            self._set_resolution(image)
-            self._process_ball_image()
-        except (cv2.error, OSError, RuntimeError) as error:
-            self._show_error("Lỗi đếm bóng", error)
-
-    def _process_ball_image(self) -> None:
-        if self.ball_source is None:
-            return
-        image = self.ball_source.copy()
-        scale = 800.0 / image.shape[1]
-        image = cv2.resize(
-            image,
-            (800, max(1, int(image.shape[0] * scale))),
-            interpolation=cv2.INTER_AREA,
-        )
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (7, 7), 0)
-        if self.manual_ball_threshold:
-            _, thresh = cv2.threshold(
-                blur,
-                self.threshold_var.get(),
-                255,
-                cv2.THRESH_BINARY_INV,
+        elif self.paused:
+            self.transport_button.configure(
+                text="▶ Phát tiếp", state=tk.NORMAL
             )
         else:
-            _, thresh = cv2.threshold(
-                blur,
-                0,
-                255,
-                cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+            self.transport_button.configure(
+                text="⏸ Tạm dừng", state=tk.NORMAL
             )
-        contours, _ = cv2.findContours(
-            thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        h_img = image.shape[0]
-        valid_contours: list[np.ndarray] = []
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            _, y, _, height = cv2.boundingRect(contour)
-            if 800 < area < 35000 and (y + height) < (h_img - 15):
-                valid_contours.append(contour)
-        cv2.drawContours(image, valid_contours, -1, (0, 255, 0), 2)
-        count = len(valid_contours)
-        cv2.putText(
-            image,
-            f"So luong: {count}",
-            (30, 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.3,
-            (0, 0, 255),
-            3,
-        )
-        self._show_image(image)
-        self._set_count(count)
-        threshold_mode = (
-            f"ngưỡng thủ công {self.threshold_var.get()}"
-            if self.manual_ball_threshold
-            else "Otsu"
-        )
-        self.status_var.set(
-            f"Bài 4 · Đã nhận diện {count} quả bóng ({threshold_mode})"
-        )
 
-    def _on_threshold_change(self, _value: str) -> None:
-        self.manual_ball_threshold = True
-        if self.active_task == "balls" and self.ball_source is not None:
-            try:
-                self._process_ball_image()
-            except cv2.error as error:
-                self._show_error("Lỗi phân ngưỡng ảnh bóng", error)
-
-    def extract_plate_characters(self, file_path: str | None = None) -> None:
-        self._stop_stream()
-        self.ball_source = None
-        self.enhance_source = None
-        self._set_task("plate", "Chọn ảnh biển số xe")
-
-        # 1. Đọc ảnh và tiền xử lý
-        path = file_path or filedialog.askopenfilename(
-            parent=self.root,
-            title="Chọn ảnh biển số xe",
-            filetypes=(("Image", "*.png *.jpg *.jpeg *.bmp"),),
-        )
-        if not path:
-            self.status_var.set("Sẵn sàng")
+    def toggle_pause(self):
+        if self.capture is None:
             return
+        self.paused = not self.paused
+        self._update_transport_button()
+        self.status_var.set(
+            self._video_status("Đã tạm dừng" if self.paused else "Đang phát")
+        )
 
+    def _prepare_display_frame(self, frame):
+        display = frame.copy()
+        if self.brightness:
+            display = np.clip(
+                display.astype(np.int16) + int(self.brightness), 0, 255
+            ).astype(np.uint8)
+        if self.color_mode == "Grayscale":
+            display = cv2.cvtColor(
+                cv2.cvtColor(display, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR
+            )
+        elif self.color_mode == "HSV":
+            display = cv2.cvtColor(display, cv2.COLOR_BGR2HSV)
+        height, width = display.shape[:2]
+        center_x, center_y = width / 2, height / 2
+        matrix = np.array(
+            [
+                [self.zoom, 0, (1 - self.zoom) * center_x + self.translate_x],
+                [0, self.zoom, (1 - self.zoom) * center_y + self.translate_y],
+            ],
+            dtype=np.float32,
+        )
+        return cv2.warpAffine(
+            display, matrix, (width, height), borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(248, 250, 252),
+        )
+
+    def _render_still_image(self):
+        if self.still_image is None:
+            return
+        display = self.still_image
+        faces = []
+        if self.mode == "faces":
+            faces = self._find_faces(display)
+            self.current_frame = display
+            self.current_faces = faces
+            display = self._draw_faces(display, faces)
+        self._show_frame(self._prepare_display_frame(self._rotated_frame(display)))
+
+    @staticmethod
+    def _draw_faces(frame, faces):
+        display = frame.copy()
+        for x, y, width, height in faces:
+            cv2.rectangle(
+                display, (x, y), (x + width - 1, y + height - 1), (0, 160, 70), 2
+            )
+        cv2.putText(
+            display, f"Faces: {len(faces)}", (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 160, 70), 2,
+        )
+        return display
+
+    def change_zoom(self, factor):
+        self.zoom = min(4.0, max(0.25, self.zoom * factor))
+        self.refresh_display()
+
+    def translate(self, dx, dy):
+        self.translate_x += dx
+        self.translate_y += dy
+        self.refresh_display()
+
+    def reset_transform(self):
+        self.zoom = 1.0
+        self.translate_x = 0
+        self.translate_y = 0
+        self.brightness = 0
+        self.brightness_var.set(0)
+        self.refresh_display()
+
+    def _brightness_changed(self, value):
+        self.brightness = int(float(value))
+        self.refresh_display()
+
+    def _color_mode_changed(self, value):
+        self.color_mode = value
+        self.refresh_display()
+
+    def refresh_display(self):
+        if self.still_image is not None and self.capture is None:
+            self._render_still_image()
+        elif self.current_frame is not None:
+            display = self.current_frame
+            if self.mode == "faces":
+                display = self._draw_faces(display, self.current_faces)
+            self._show_frame(
+                self._prepare_display_frame(self._rotated_frame(display))
+            )
+
+    def _video_status(self, message):
+        if self.source_name:
+            return f"{message}  |  {self.source_name}"
+        return message
+
+    def choose_video(self):
+        path = filedialog.askopenfilename(
+            title="Chọn file video",
+            filetypes=(
+                ("Video", "*.mp4 *.avi *.mov *.mkv *.wmv"),
+                ("Tất cả file", "*.*"),
+            ),
+        )
+        if path:
+            self.open_video(path)
+
+    def choose_balloon_image(self):
+        path = filedialog.askopenfilename(
+            title="Chọn ảnh để đếm bóng bay",
+            filetypes=(
+                ("Ảnh", "*.jpg *.jpeg *.png *.bmp *.webp"),
+                ("Tất cả file", "*.*"),
+            ),
+        )
+        if path:
+            self.open_balloon_image(path)
+
+    def open_balloon_image(self, path):
         try:
-            image = cv2.imread(path)
-            if image is None:
-                raise RuntimeError("Không thể đọc file ảnh đã chọn.")
-            self._process_plate_image(image)
-        except (cv2.error, OSError, RuntimeError) as error:
-            self._show_error("Lỗi xử lý biển số", error)
-
-    def _process_plate_image(self, image: np.ndarray) -> None:
-        # Resize ảnh về width = 900px (tính height theo đúng tỉ lệ aspect ratio)
-        orig_h, orig_w = image.shape[:2]
-        target_w = 900
-        target_h = max(1, int(orig_h * (target_w / float(orig_w))))
-        image = cv2.resize(
-            image,
-            (target_w, target_h),
-            interpolation=cv2.INTER_AREA if orig_w > target_w else cv2.INTER_LINEAR,
-        )
-        self._set_resolution(image)
-
-        # Chuyển sang ảnh xám và làm mờ nhẹ
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-
-        # 2. Phân ngưỡng nhị phân thích ứng
-        _, thresh = cv2.threshold(
-            blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-        )
-        contours, _ = cv2.findContours(
-            thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
-        )
-
-        # 3. Lọc chính xác các ký tự biển số (loại bỏ dòng chữ slide phía trên và viền ngoài)
-        valid_chars: list[tuple[int, int, int, int]] = []
-        for c in contours:
-            x, y, w, h = cv2.boundingRect(c)
-            area = cv2.contourArea(c)
-            # Điều kiện nhận diện ký tự biển số trên ảnh width 900px:
-            # - Chiều cao ký tự h từ 35px đến 160px
-            # - Chiều rộng w từ 12px đến 90px
-            # - Tỷ lệ w/h từ 0.2 đến 0.95
-            # - Diện tích contour > 250 và không chiếm toàn bộ khung
-            if 35 <= h <= 160 and 12 <= w <= 90 and 0.2 <= (w / float(h)) <= 0.95 and area > 250:
-                valid_chars.append((x, y, w, h))
-
-        # Loại bỏ các box lồng nhau (ví dụ lỗ bên trong ký tự) nếu có
-        cleaned_chars: list[tuple[int, int, int, int]] = []
-        for i, b1 in enumerate(valid_chars):
-            x1, y1, w1, h1 = b1
-            is_inside = any(
-                i != j
-                and x2 <= x1
-                and y2 <= y1
-                and (x2 + w2) >= (x1 + w1)
-                and (y2 + h2) >= (y1 + h1)
-                for j, (x2, y2, w2, h2) in enumerate(valid_chars)
-            )
-            if not is_inside:
-                cleaned_chars.append(b1)
-        valid_chars = cleaned_chars
-
-        # 4. Sắp xếp và trích xuất ký tự
-        valid_chars.sort(key=lambda b: b[0])
-        os.makedirs("digits_plate", exist_ok=True)
-        for i, (x, y, w, h) in enumerate(valid_chars):
-            crop = image[y : y + h, x : x + w].copy()
-            cv2.imwrite(f"digits_plate/digit_{i}.png", crop)
-            cv2.rectangle(image, (x, y), (x + w, y + h), (0, 0, 255), 2)
-
-        # 5. Hiển thị kết quả lên Canvas Tkinter
-        self._show_image(image)
-        self._set_count(len(valid_chars))
-        self.status_var.set(
-            f"Bài 5: Đã trích xuất thành công {len(valid_chars)} ký tự vào thư mục digits_plate"
-        )
-
-    def enhance_brightness_and_resize(self) -> None:
-        self._process_selected_image(
-            "enhance",
-            "Chọn ảnh cần cân bằng sáng",
-            self._process_enhanced_image,
-        )
-
-    def _process_enhanced_image(self, image: np.ndarray) -> None:
-        self.enhance_source = image.copy()
-        self._set_resolution(image)
-        self._render_enhanced_image()
-
-    def _render_enhanced_image(self) -> None:
-        if self.enhance_source is None:
+            image = self._read_image(path)
+        except (OSError, cv2.error) as error:
+            self.status_var.set(f"Lỗi đọc ảnh: {error}")
             return
-        image = self.enhance_source.copy()
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        hsv[:, :, 2] = cv2.equalizeHist(hsv[:, :, 2])
-        enhanced = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-        brightness = self.brightness_var.get()
-        if brightness:
-            enhanced = cv2.convertScaleAbs(enhanced, alpha=1.0, beta=brightness)
-        resized = cv2.resize(
-            enhanced, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_LINEAR
+        if image is None:
+            self.status_var.set(f"Không mở được ảnh: {path}")
+            return
+
+        self.balloon_image = image
+        self.balloon_image_path = path
+        self.balloon_detections = []
+        self._show_frame(image)
+        self.status_var.set(f"Đang đếm bóng bay  |  {Path(path).name}")
+        self._process_balloon_image()
+
+    def _process_balloon_image(self):
+        try:
+            self._detect_and_show_balloons()
+        except Exception as error:
+            self.status_var.set(f"Lỗi xử lý bóng bay: {error}")
+
+    def choose_plate_image(self):
+        path = filedialog.askopenfilename(
+            title="Chọn ảnh có biển số xe",
+            filetypes=(
+                ("Ảnh", "*.jpg *.jpeg *.png *.bmp *.webp"),
+                ("Tất cả file", "*.*"),
+            ),
         )
-        target_height, target_width = resized.shape[:2]
-        original = cv2.resize(
-            image, (target_width, target_height), interpolation=cv2.INTER_LINEAR
+        if path:
+            self.open_plate_image(path)
+
+    def open_plate_image(self, path):
+        try:
+            image = self._read_image(path)
+        except (OSError, cv2.error) as error:
+            self.status_var.set(f"Lỗi đọc ảnh: {error}")
+            return
+        if image is None:
+            self.status_var.set(f"Không mở được ảnh: {path}")
+            return
+
+        self.plate_image = image
+        self.plate_image_path = path
+        self._show_frame(image)
+        self.status_var.set(f"Đang tách ký tự  |  {Path(path).name}")
+        self._process_plate_image()
+
+    def _process_plate_image(self):
+        try:
+            self._detect_and_crop_plate_characters()
+        except Exception as error:
+            self.status_var.set(f"Lỗi xử lý biển số: {error}")
+
+    def _detect_plates(self, image):
+        image_height, image_width = image.shape[:2]
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blurred, 50, 150)
+        close_kernel = cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (max(3, image_width // 100), max(3, image_height // 80)),
         )
-        comparison = np.hstack((original, resized))
+        edge_mask = cv2.morphologyEx(
+            edges, cv2.MORPH_CLOSE, close_kernel, iterations=2
+        )
+        _, threshold_mask = cv2.threshold(
+            blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+        threshold_mask = cv2.morphologyEx(
+            threshold_mask, cv2.MORPH_CLOSE, close_kernel, iterations=2
+        )
+
+        candidates = []
+        minimum_width = max(40, int(image_width * 0.12))
+        minimum_height = max(16, int(image_height * 0.025))
+        minimum_area = image_width * image_height * 0.002
+        for mask in (edge_mask, threshold_mask, cv2.bitwise_not(threshold_mask)):
+            contours, _ = cv2.findContours(
+                mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                x, y, width, height = cv2.boundingRect(contour)
+                ratio = width / max(height, 1)
+                if (
+                    area >= minimum_area
+                    and width >= minimum_width
+                    and height >= minimum_height
+                    and 2.0 <= ratio <= 6.5
+                ):
+                    box = (x, y, x + width, y + height)
+                    if not any(self._boxes_overlap(box, existing) for existing in candidates):
+                        candidates.append(box)
+
+        candidates.sort(
+            key=lambda box: (box[2] - box[0]) * (box[3] - box[1]),
+            reverse=True,
+        )
+        return candidates[:10]
+
+    @staticmethod
+    def _boxes_overlap(first, second):
+        left = max(first[0], second[0])
+        top = max(first[1], second[1])
+        right = min(first[2], second[2])
+        bottom = min(first[3], second[3])
+        intersection = max(0, right - left) * max(0, bottom - top)
+        first_area = (first[2] - first[0]) * (first[3] - first[1])
+        second_area = (second[2] - second[0]) * (second[3] - second[1])
+        union = first_area + second_area - intersection
+        return union > 0 and (
+            intersection / union > 0.5
+            or intersection / min(first_area, second_area) > 0.7
+        )
+
+    @staticmethod
+    def _segment_plate_characters(plate):
+        plate_height, plate_width = plate.shape[:2]
+        if plate_height < 12 or plate_width < 24:
+            return []
+
+        scale = 160 / plate_height
+        resized_width = max(1, round(plate_width * scale))
+        resized = cv2.resize(plate, (resized_width, 160), interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        _, binary = cv2.threshold(
+            gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+        masks = [
+            binary,
+            cv2.bitwise_not(binary),
+            cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY_INV, 31, 7,
+            ),
+        ]
+
+        candidates = []
+        for mask in masks:
+            contours, _ = cv2.findContours(
+                mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
+            )
+            boxes = []
+            for contour in contours:
+                x, y, width, height = cv2.boundingRect(contour)
+                aspect_ratio = width / height if height else 0
+                if (
+                    height >= 0.2 * 160
+                    and height <= 0.94 * 160
+                    and width >= 0.018 * resized_width
+                    and width <= 0.22 * resized_width
+                    and 0.08 <= aspect_ratio <= 1.15
+                ):
+                    boxes.append((x, y, x + width, y + height))
+            if len(boxes) > len(candidates):
+                candidates = boxes
+
+        if not candidates:
+            return []
+
+        outer_candidates = []
+        for box in sorted(
+            candidates,
+            key=lambda item: (item[2] - item[0]) * (item[3] - item[1]),
+            reverse=True,
+        ):
+            left, top, right, bottom = box
+            area = (right - left) * (bottom - top)
+            is_inner_contour = any(
+                left >= outer[0]
+                and top >= outer[1]
+                and right <= outer[2]
+                and bottom <= outer[3]
+                and area < (outer[2] - outer[0]) * (outer[3] - outer[1]) * 0.7
+                for outer in outer_candidates
+            )
+            if not is_inner_contour:
+                outer_candidates.append(box)
+        candidates = outer_candidates
+
+        candidates.sort(key=lambda box: (box[1] + box[3]) / 2)
+        rows = []
+        for box in candidates:
+            center_y = (box[1] + box[3]) / 2
+            row = next(
+                (items for items in rows if abs(items[0] - center_y) < 0.22 * 160),
+                None,
+            )
+            if row is None:
+                rows.append([center_y, [box]])
+            else:
+                row[1].append(box)
+
+        characters = []
+        for _, row_boxes in sorted(rows, key=lambda row: row[0]):
+            for left, top, right, bottom in sorted(row_boxes, key=lambda box: box[0]):
+                x1 = max(0, int(left / scale) - 2)
+                y1 = max(0, int(top / scale) - 2)
+                x2 = min(plate_width, int(right / scale) + 2)
+                y2 = min(plate_height, int(bottom / scale) + 2)
+                if x2 > x1 and y2 > y1:
+                    characters.append((x1, y1, x2, y2))
+        return characters
+
+    def _detect_and_crop_plate_characters(self):
+        plates = self._detect_plates(self.plate_image)
+        display = self.plate_image.copy()
+        output_dir = Path("output_data/plate_digits")
+        os.makedirs("output_data/plate_digits", exist_ok=True)
+        saved = 0
+        character_boxes = []
+
+        for plate_index, (left, top, right, bottom) in enumerate(plates, 1):
+            cv2.rectangle(display, (left, top), (right, bottom), (0, 255, 0), 2)
+            cv2.putText(
+                display,
+                "Bien so",
+                (left, max(20, top - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2,
+            )
+            plate_crop = self.plate_image[top:bottom, left:right]
+            for character_index, (x1, y1, x2, y2) in enumerate(
+                self._segment_plate_characters(plate_crop), 1
+            ):
+                absolute_box = (left + x1, top + y1, left + x2, top + y2)
+                character_boxes.append(absolute_box)
+                character_crop = plate_crop[y1:y2, x1:x2]
+                output_path = output_dir / (
+                    f"plate_{plate_index:02d}_char_{character_index:02d}.png"
+                )
+                if self._write_image(output_path, character_crop):
+                    saved += 1
+
+        for left, top, right, bottom in character_boxes:
+            cv2.rectangle(display, (left, top), (right, bottom), (255, 160, 0), 1)
         cv2.putText(
-            comparison,
-            "Original",
-            (10, 30),
+            display,
+            f"Bien so: {len(plates)}  Ky tu da tach: {saved}",
+            (12, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,
             (0, 255, 0),
             2,
         )
+        self._show_frame(display)
+        if saved:
+            self.status_var.set(
+                f"Đã tách {saved} ký tự, lưu trong {output_dir}"
+            )
+        elif plates:
+            self.status_var.set(
+                "Đã tìm thấy biển số nhưng chưa tách được ký tự rõ ràng"
+            )
+        else:
+            self.status_var.set("Không tìm thấy biển số trong ảnh")
+
+    def _detect_and_show_balloons(self):
+        height, width = self.balloon_image.shape[:2]
+        minimum_dimension = min(height, width)
+        hsv = cv2.cvtColor(self.balloon_image, cv2.COLOR_BGR2HSV)
+        saturated_colors = cv2.inRange(
+            hsv, np.array((0, 40, 35)), np.array((179, 255, 255))
+        )
+        dark_objects = cv2.inRange(
+            hsv, np.array((0, 0, 0)), np.array((179, 255, 75))
+        )
+        foreground = cv2.bitwise_or(saturated_colors, dark_objects)
+        cleanup_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (3, 3)
+        )
+        mask = cv2.morphologyEx(
+            foreground, cv2.MORPH_OPEN, cleanup_kernel
+        )
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        minimum_area = max(30.0, height * width * 0.0002)
+        maximum_area = height * width * 0.15
+        balloon_candidates = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if not minimum_area <= area <= maximum_area:
+                continue
+            x, y, box_width, box_height = cv2.boundingRect(contour)
+            aspect = box_width / max(box_height, 1)
+            if (
+                box_width < minimum_dimension * 0.025
+                or box_height < minimum_dimension * 0.035
+                or not 0.3 <= aspect <= 1.2
+            ):
+                continue
+            balloon_candidates.append((x, y, x + box_width, y + box_height))
+
+        balloon_candidates.sort(key=lambda box: (box[1], box[0]))
+        detections = [(*box, 1.0) for box in balloon_candidates]
+        self.balloon_detections = detections
+        display = self.balloon_image.copy()
+        for left, top, right, bottom in balloon_candidates:
+            cv2.rectangle(display, (left, top), (right, bottom), (0, 160, 70), 2)
+            cv2.putText(
+                display,
+                "Bong bay",
+                (left, max(20, top - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 160, 70),
+                2,
+            )
         cv2.putText(
-            comparison,
-            f"Enhanced + Resize 1.5x | Brightness +{brightness}",
-            (target_width + 10, 30),
+            display,
+            f"So bong bay: {len(detections)}",
+            (12, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
+            0.9,
+            (0, 160, 70),
             2,
         )
-        self._show_image(comparison)
-        self.status_var.set(
-            f"Bài 6 · Cân bằng sáng, resize 1.5× · Độ sáng +{brightness}"
-        )
-
-    def _on_brightness_change(self, _value: str) -> None:
-        if self.active_task == "enhance" and self.enhance_source is not None:
-            try:
-                self._render_enhanced_image()
-            except cv2.error as error:
-                self._show_error("Lỗi điều chỉnh độ sáng", error)
-
-    def _process_selected_image(
-        self,
-        task: str,
-        title: str,
-        processor: Callable[[np.ndarray], None],
-        error_title: str = "Lỗi xử lý ảnh",
-    ) -> None:
-        self._stop_stream()
-        self.ball_source = None
-        self.enhance_source = None
-        self._set_task(task, title)
-        path = filedialog.askopenfilename(
-            parent=self.root,
-            title=title,
-            filetypes=(("Image", "*.png *.jpg *.jpeg *.bmp"),),
-        )
-        if not path:
-            self.status_var.set("Sẵn sàng")
+        self._show_frame(display)
+        output_dir = Path("output_data/balloons")
+        os.makedirs("output_data/balloons", exist_ok=True)
+        output_path = output_dir / f"{Path(self.balloon_image_path).stem}_counted.png"
+        if not self._write_image(output_path, display):
+            self.status_var.set(f"Không thể lưu ảnh kết quả đếm bóng bay: {output_path}")
             return
+        self.status_var.set(
+            f"Tìm thấy {len(detections)} bóng bay  |  "
+            f"Đã lưu ảnh vào {output_path}"
+        )
+
+    def open_video(self, path):
+        if self.mode in ("balloons", "plate"):
+            self.set_mode("rotate")
         try:
-            image = cv2.imread(path)
-            if image is None:
-                raise RuntimeError("Không thể đọc file ảnh đã chọn.")
-            processor(image)
-        except (cv2.error, OSError, RuntimeError) as error:
-            self._show_error(error_title, error)
+            new_capture = cv2.VideoCapture(path)
+            if not new_capture.isOpened():
+                new_capture.release()
+                self.status_var.set(f"Không mở được video: {path}")
+                return
+        except cv2.error as error:
+            self.status_var.set(f"Lỗi mở video: {error}")
+            return
 
-    def _next_numeric_filename(self, directory: str) -> int:
-        numbers: list[int] = []
-        for name in os.listdir(directory):
-            stem, extension = os.path.splitext(name)
-            if extension.lower() == ".png" and stem.isdigit():
-                numbers.append(int(stem))
-        return max(numbers, default=-1) + 1
+        self._stop_camera_reader()
+        if self.capture is not None:
+            self.capture.release()
+        self.capture = new_capture
+        self.video_path = path
+        self.source_name = Path(path).name
+        self.is_webcam = False
+        self.paused = False
+        self.still_image = None
+        self.still_image_path = None
+        fps = self.capture.get(cv2.CAP_PROP_FPS)
+        frame_count = self.capture.get(cv2.CAP_PROP_FRAME_COUNT)
+        if fps > 0:
+            self.frame_interval_ms = max(1, round(1000 / fps))
+            self.duration_seconds = frame_count / fps
+        else:
+            self.duration_seconds = 0.0
+        self.seek_scale.configure(
+            to=max(self.duration_seconds, 0.1),
+            state=tk.NORMAL if self.duration_seconds > 0 else tk.DISABLED,
+        )
+        self.seek_var.set(0)
+        self.position_var.set("00:00")
+        self.duration_var.set(self._format_time(self.duration_seconds))
+        self.seeking = False
+        self.replay_button.configure(state=tk.DISABLED)
+        self.current_frame = None
+        self._update_transport_button()
+        self.status_var.set(self._video_status("Đang phát"))
 
-    def _on_close(self) -> None:
-        self._stop_stream()
+    def replay_video(self):
+        if self.video_path:
+            self.open_video(self.video_path)
+
+    @staticmethod
+    def _format_time(seconds):
+        total_seconds = max(0, int(seconds))
+        minutes, seconds = divmod(total_seconds, 60)
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def _seek_changed(self, value):
+        self.position_var.set(self._format_time(float(value)))
+
+    def _start_seek(self, _event):
+        self.seeking = True
+
+    def _finish_seek(self, _event):
+        target_seconds = self.seek_var.get()
+        self.seeking = False
+        if not self.video_path:
+            return
+        if self.capture is None:
+            self.open_video(self.video_path)
+        if self.capture is not None:
+            self.capture.set(cv2.CAP_PROP_POS_MSEC, target_seconds * 1000)
+            self.current_frame = None
+            self.current_faces = []
+            self.replay_button.configure(state=tk.DISABLED)
+            self.status_var.set(self._video_status("Đang phát"))
+
+    def rotate(self, direction):
+        self.turns_clockwise = (self.turns_clockwise + direction) % 4
+        self.refresh_display()
+
+    def on_key(self, event):
+        key = event.keysym.lower()
+        if key in ("q", "escape"):
+            self.close()
+            return "break"
+        if key == "space":
+            self.toggle_pause()
+            return "break"
+        if self.mode == "rotate" and key == "a":
+            self.rotate(-1)
+            return "break"
+        if self.mode == "rotate" and key == "d":
+            self.rotate(1)
+            return "break"
+        if self.mode == "faces" and key == "s":
+            self.save_faces()
+            return "break"
+
+    def _rotated_frame(self, frame):
+        rotated = frame
+        for _ in range(self.turns_clockwise):
+            rotated = cv2.rotate(rotated, cv2.ROTATE_90_CLOCKWISE)
+        return rotated
+
+    def _ensure_face_detector(self):
+        if self.face_detector is not None or self.face_cascade is not None:
+            return
+        if self.detector_loading:
+            return
+
+        self.detector_loading = True
+        self.status_var.set(self._video_status("Đang tải bộ nhận diện khuôn mặt"))
+
+        def load_detector():
+            try:
+                if hasattr(cv2, "FaceDetectorYN_create"):
+                    model_path = Path(__file__).with_name(
+                        "face_detection_yunet_2023mar.onnx"
+                    )
+                    if not model_path.exists():
+                        model_url = (
+                            "https://github.com/opencv/opencv_zoo/raw/refs/heads/main/"
+                            "models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+                        )
+                        urlretrieve(model_url, model_path)
+                    detector = cv2.FaceDetectorYN_create(
+                        str(model_path), "", (320, 320), 0.8, 0.3, 5000
+                    )
+                    self.root.after(0, self._detector_ready, detector, None, None)
+                else:
+                    cascade = cv2.CascadeClassifier(
+                        cv2.data.haarcascades
+                        + "haarcascade_frontalface_default.xml"
+                    )
+                    if cascade.empty():
+                        raise RuntimeError("Không tải được bộ nhận diện khuôn mặt.")
+                    self.root.after(0, self._detector_ready, None, cascade, None)
+            except Exception as error:
+                try:
+                    self.root.after(
+                        0, self._detector_ready, None, None, str(error)
+                    )
+                except tk.TclError:
+                    pass
+
+        threading.Thread(target=load_detector, daemon=True).start()
+
+    def _detector_ready(self, detector, cascade, error):
+        self.detector_loading = False
+        if error:
+            self.status_var.set(f"Lỗi nhận diện: {error}")
+            return
+
+        self.face_detector = detector
+        self.face_cascade = cascade
+        if self.mode == "faces" and self.still_image is not None:
+            self._render_still_image()
+            self.status_var.set(
+                f"Ảnh: {self.source_name}  |  "
+                f"Tìm thấy {len(self.current_faces)} khuôn mặt"
+            )
+        elif self.mode == "faces":
+            self.status_var.set(self._video_status("Đang nhận diện khuôn mặt"))
+
+    def _find_faces(self, frame):
+        frame_height, frame_width = frame.shape[:2]
+        if self.face_detector is not None:
+            self.face_detector.setInputSize((frame_width, frame_height))
+            _, detections = self.face_detector.detect(frame)
+            detections = detections if detections is not None else []
+            faces = [
+                tuple(int(value) for value in detection[:4])
+                for detection in detections
+            ]
+        elif self.face_cascade is not None:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = self.face_cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(30, 30),
+            )
+        else:
+            return []
+
+        bounded_faces = []
+        for x, y, width, height in faces:
+            left = max(0, x)
+            top = max(0, y)
+            right = min(frame_width, x + width)
+            bottom = min(frame_height, y + height)
+            if right > left and bottom > top:
+                bounded_faces.append((left, top, right - left, bottom - top))
+        return bounded_faces
+
+    def _show_frame(self, frame):
+        area_width = max(self.video_canvas.winfo_width(), 320)
+        area_height = max(self.video_canvas.winfo_height(), 240)
+        scale = min(
+            area_width / frame.shape[1], area_height / frame.shape[0], 1.0
+        )
+        width = max(1, int(frame.shape[1] * scale))
+        height = max(1, int(frame.shape[0] * scale))
+        resized = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+        success, encoded = cv2.imencode(".png", resized)
+        if not success:
+            return
+
+        image_data = base64.b64encode(encoded).decode("ascii")
+        self.photo = tk.PhotoImage(data=image_data, format="png")
+        position = (area_width // 2, area_height // 2)
+        if self.image_item is None:
+            self.video_canvas.delete(self.placeholder_item)
+            self.image_item = self.video_canvas.create_image(
+                *position, image=self.photo, anchor="center"
+            )
+        else:
+            self.video_canvas.coords(self.image_item, *position)
+            self.video_canvas.itemconfigure(self.image_item, image=self.photo)
+
+    def update_frame(self):
+        if self.closing:
+            return
+
+        frame_started = time.perf_counter()
+        if self.capture is not None and not self.paused:
+            try:
+                camera_waiting = False
+                if self.is_webcam:
+                    if self.camera_error:
+                        error = self.camera_error
+                        self._stop_camera_reader()
+                        self.paused = True
+                        self._update_transport_button()
+                        self.status_var.set(error)
+                        success, frame = False, None
+                        camera_waiting = True
+                    else:
+                        with self.camera_frame_lock:
+                            frame = (
+                                self.camera_frame.copy()
+                                if self.camera_frame is not None else None
+                            )
+                        success = frame is not None
+                        camera_waiting = not success
+                else:
+                    success, frame = self.capture.read()
+                if success:
+                    self.current_frame = frame
+                    self.current_faces = []
+                    if self.mode == "faces":
+                        self.current_faces = self._find_faces(frame)
+                        if self.is_webcam:
+                            display_frame = cv2.flip(frame, 1)
+                            mirrored_faces = [
+                                (frame.shape[1] - x - width, y, width, height)
+                                for x, y, width, height in self.current_faces
+                            ]
+                            display_frame = self._draw_faces(
+                                display_frame, mirrored_faces
+                            )
+                        else:
+                            display_frame = self._draw_faces(
+                                frame, self.current_faces
+                            )
+                    else:
+                        display_frame = frame
+                    if self.is_webcam and self.mode != "faces":
+                        display_frame = cv2.flip(display_frame, 1)
+                    display_frame = self._rotated_frame(display_frame)
+                    self._show_frame(self._prepare_display_frame(display_frame))
+                    if not self.is_webcam:
+                        position_seconds = (
+                            self.capture.get(cv2.CAP_PROP_POS_MSEC) / 1000
+                        )
+                        position_seconds = min(
+                            position_seconds, self.duration_seconds
+                        )
+                        if not self.seeking:
+                            self.seek_var.set(position_seconds)
+                            self.position_var.set(
+                                self._format_time(position_seconds)
+                            )
+                elif not camera_waiting:
+                    was_webcam = self.is_webcam
+                    self.capture.release()
+                    self.capture = None
+                    self.paused = True
+                    self._update_transport_button()
+                    if was_webcam:
+                        self.status_var.set(
+                            "Mất kết nối webcam. Kiểm tra camera rồi mở lại."
+                        )
+                    else:
+                        self.seek_var.set(self.duration_seconds)
+                        self.position_var.set(
+                            self._format_time(self.duration_seconds)
+                        )
+                        self.replay_button.configure(state=tk.NORMAL)
+                        self.status_var.set(self._video_status("Video đã phát hết"))
+            except Exception as error:
+                if self.is_webcam:
+                    self._stop_camera_reader()
+                elif self.capture is not None:
+                    self.capture.release()
+                    self.capture = None
+                self.paused = True
+                self._update_transport_button()
+                self.status_var.set(f"Lỗi xử lý luồng video: {error}")
+
+        if self.capture is None or self.paused or self.mode in ("balloons", "plate"):
+            delay_ms = 100
+        else:
+            elapsed_ms = (time.perf_counter() - frame_started) * 1000
+            delay_ms = max(1, round(self.frame_interval_ms - elapsed_ms))
+        self.root.after(delay_ms, self.update_frame)
+
+    def save_faces(self):
+        if self.current_frame is None or not self.current_faces:
+            self.status_var.set(self._video_status("Không có khuôn mặt để lưu"))
+            return
+
+        output_dir = Path("output_data/faces")
+        os.makedirs("output_data/faces", exist_ok=True)
+        timestamp = f"{time.strftime('%Y%m%d_%H%M%S')}_{int(time.time() * 1000)}"
+        saved = 0
+        for index, (x, y, width, height) in enumerate(self.current_faces):
+            face_image = self.current_frame[y:y + height, x:x + width]
+            output_path = output_dir / f"face_{timestamp}_{index + 1:02d}.png"
+            if cv2.imwrite(str(output_path), face_image):
+                saved += 1
+        self.status_var.set(
+            self._video_status(
+                f"Đã lưu {saved} ảnh khuôn mặt vào {output_dir}"
+            )
+        )
+
+    def close(self):
+        if self.closing:
+            return
+        self.closing = True
+        if self.is_webcam:
+            self._stop_camera_reader()
+        elif self.capture is not None:
+            self.capture.release()
         self.root.destroy()
 
 
-def main() -> None:
+def main():
+    if _CV_IMPORT_ERROR is not None:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(
+            "Thiếu thư viện",
+            "Không thể chạy ứng dụng vì thiếu OpenCV hoặc NumPy.\n"
+            "Cài đặt bằng lệnh: pip install opencv-python numpy\n\n"
+            f"Chi tiết: {_CV_IMPORT_ERROR}",
+        )
+        root.destroy()
+        return
+
+    parser = argparse.ArgumentParser(
+        description="Image and video processing application."
+    )
+    parser.add_argument("video", nargs="?", help="Path to a video file")
+    parser.add_argument(
+        "--mode",
+        choices=("rotate", "faces", "balloons", "plate"),
+        default="rotate",
+        help="Initial mode: rotate, faces, balloons, or plate",
+    )
+    args = parser.parse_args()
+
     root = tk.Tk()
-    ComputerVisionApp(root)
+    VideoApp(root, args.video, args.mode)
     root.mainloop()
 
 
